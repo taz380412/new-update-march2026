@@ -1,0 +1,244 @@
+name: RDP 2026 (Windows 11)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      backup_number:
+        description: "MuMu Backup Number (1, 2, 3...)"
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  full:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: "Automation King Taz"
+      RDP_PASS: "1234@AutomationKingTaz"
+      BACKUP_LIST_URL: "http://100.72.179.64:8000/FilesForRDP/mumubackupurl.txt"
+      UPDATE_API: "https://myitagency.com/rdp/update.php"
+
+    steps:
+
+      # ---------------- BASIC ----------------
+      - name: Show runner info
+        shell: pwsh
+        run: |
+          whoami
+          systeminfo | findstr /B /C:"OS Name"
+
+      # ---------------- TAILSCALE ----------------
+      - name: Install and Start Tailscale
+        shell: pwsh
+        run: |
+          $exe = "$env:ProgramFiles\\Tailscale\\tailscale.exe"
+
+          if (-not (Test-Path $exe)) {
+            Invoke-WebRequest `
+              https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi `
+              -OutFile tailscale.msi
+            Start-Process msiexec.exe -ArgumentList "/i tailscale.msi /quiet /norestart" -Wait
+          }
+
+          Start-Service Tailscale
+          Start-Sleep 10
+
+          & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet"
+
+          for ($i=0; $i -lt 10; $i++) {
+            $ip = & $exe ip -4 | Select-Object -First 1
+            if ($ip) { break }
+            Start-Sleep 3
+          }
+
+          if (-not $ip) { throw "Tailscale IP not found" }
+
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
+      # ---------------- RDP + USER PROFILE ----------------
+      - name: Enable RDP and Create User Profile
+        shell: pwsh
+        run: |
+          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+
+          if (-not (Get-LocalUser $env:RDP_USER -EA SilentlyContinue)) {
+            New-LocalUser $env:RDP_USER -Password $sec
+            Add-LocalGroupMember Administrators $env:RDP_USER
+            Add-LocalGroupMember "Remote Desktop Users" $env:RDP_USER
+          }
+
+          Set-ItemProperty `
+            "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # ─── User Profile Force Create ───
+          Write-Host "Creating user profile..."
+
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public class ProfileHelper {
+              [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern int CreateProfile(
+                  string pszUserSid,
+                  string pszUserName,
+                  StringBuilder pszProfilePath,
+                  uint cchProfilePath);
+          }
+          "@
+
+          $user = Get-LocalUser $env:RDP_USER
+          $sid  = $user.SID.Value
+          $pathBuilder = New-Object System.Text.StringBuilder 260
+
+          $result = [ProfileHelper]::CreateProfile($sid, $env:RDP_USER, $pathBuilder, 260)
+          $profilePath = $pathBuilder.ToString()
+
+          if ($profilePath -and (Test-Path $profilePath)) {
+            $desktop = "$profilePath\\Desktop"
+          } else {
+            $desktop = "C:\\Users\\$($env:RDP_USER)\\Desktop"
+            New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+          }
+
+          if (-not (Test-Path $desktop)) {
+            New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+          }
+
+          icacls $desktop /grant "${env:RDP_USER}:(OI)(CI)F" /T /Q
+
+          Write-Host "Desktop path: $desktop"
+          echo "USER_DESKTOP=$desktop" >> $env:GITHUB_ENV
+
+      # ---------------- IP & SERIAL LOG ----------------
+      - name: Show IP and Serial
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  $env:TS_IP  |  ${{ inputs.backup_number }}"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      # ============================================================
+      #       FETCH TXT + PARALLEL DOWNLOAD (6 FILES)
+      # ============================================================
+      - name: "Download All Files (Backup #${{ inputs.backup_number }})"
+        shell: pwsh
+        run: |
+          $desktop = $env:USER_DESKTOP
+          $num     = "${{ inputs.backup_number }}"
+
+          Write-Host "Fetching backup list from server..."
+          $txtContent = (Invoke-WebRequest -Uri $env:BACKUP_LIST_URL -UseBasicParsing).Content
+          $lines = $txtContent -split "`n" | Where-Object { $_.Trim() -ne "" }
+
+          $found = $false
+          $backupName = ""
+          $backupUrl  = ""
+
+          foreach ($line in $lines) {
+            $parts = $line.Trim() -split "\\|"
+            if ($parts.Count -ge 3 -and $parts[0].Trim() -eq $num) {
+              $backupName = $parts[1].Trim()
+              $backupUrl  = $parts[2].Trim()
+              $found = $true
+              break
+            }
+          }
+
+          if (-not $found) {
+            throw "Backup number $num not found in mumubackupurl.txt!"
+          }
+
+          # ── Updated Common URLs ──
+          $mumuUrl    = "http://100.72.179.64:8000/FilesForRDP/MuMu.exe"
+          $zipUrl     = "http://100.72.179.64:8000/FilesForRDP/YariFinal.zip"
+          $restoreUrl = "http://100.72.179.64:8000/FilesForRDP/Restore.bat"
+          $cdownUrl   = "http://100.72.179.64:8000/FilesForRDP/cDown.bat"
+          $startUrl   = "http://100.72.179.64:8000/FilesForRDP/Start.bat"
+
+          Write-Host "Starting 6 parallel downloads..."
+
+          $job1 = Start-Job -Name "MuMu" -ScriptBlock {
+            param($url, $dest)
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          } -ArgumentList $mumuUrl, "$desktop\\MuMu.exe"
+
+          $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
+            param($url, $dest)
+            $zipPath = "$dest\\YariFinal.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+            Expand-Archive -Path $zipPath -DestinationPath "$dest\\YariFinal" -Force
+            Remove-Item $zipPath -Force
+          } -ArgumentList $zipUrl, $desktop
+
+          $job3 = Start-Job -Name "Backup" -ScriptBlock {
+            param($url, $dest)
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          } -ArgumentList $backupUrl, "$desktop\\$backupName"
+
+          $job4 = Start-Job -Name "RestoreTxt" -ScriptBlock {
+            param($url, $dest)
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          } -ArgumentList $restoreUrl, "$desktop\\Restore.bat"
+
+          $job5 = Start-Job -Name "CDownBat" -ScriptBlock {
+            param($url, $dest)
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          } -ArgumentList $cdownUrl, "$desktop\\cDown.bat"
+
+          $job6 = Start-Job -Name "StartBat" -ScriptBlock {
+            param($url, $dest)
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+          } -ArgumentList $startUrl, "$desktop\\Start.bat"
+
+          $allJobs = @($job1, $job2, $job3, $job4, $job5, $job6)
+          $allJobs | Wait-Job
+          $allJobs | Remove-Job -Force
+
+          Write-Host "Downloads Finished!"
+
+      # ---------------- PYTHON ----------------
+      - name: Install Python modules
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install customtkinter uiautomator2 opencv-python playwright
+          playwright install
+
+      # ---------------- UPDATE DASHBOARD API ----------------
+      - name: Update Dashboard API
+        shell: pwsh
+        run: |
+          $ip = $env:TS_IP
+          $serial = "${{ inputs.backup_number }}"
+          $user = "$env:GITHUB_ACTOR"
+          
+          # ডাটা ফরম্যাট: IP|Serial|User
+          $info = "$($ip)|$($serial)|$($user)"
+          $encoded = [uri]::EscapeDataString($info)
+          
+          Write-Host "Updating Dashboard at $env:UPDATE_API"
+          Invoke-WebRequest -Uri "$($env:UPDATE_API)?info=$encoded" -Method Get -UseBasicParsing
+
+      # ---------------- KEEP ALIVE ----------------
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          Write-Host "VM alive for 6 hours... RDP is Ready!"
+          Start-Sleep -Seconds 21600
+
+      - name: Done
+        shell: pwsh
+        run: Write-Host "Workflow Finished."
