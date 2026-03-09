@@ -80,7 +80,6 @@ jobs:
             -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          # ─── User Profile Force Create ───
           Write-Host "Creating user profile..."
 
           Add-Type -TypeDefinition @"
@@ -141,11 +140,13 @@ jobs:
 
           Write-Host "Fetching backup list from server..."
 
-          # Fix: RawContentBytes দিয়ে UTF8 string, \r সরাও
-          $response   = Invoke-WebRequest -Uri $env:BACKUP_LIST_URL -UseBasicParsing
-          $txtContent = [System.Text.Encoding]::UTF8.GetString($response.RawContentBytes)
-          $lines      = ($txtContent -replace "`r", "") -split "`n" |
-                        Where-Object { $_.Trim() -ne "" }
+          # ✅ FIX: WebClient.DownloadString() — সবচেয়ে reliable, null হয় না
+          $wc         = New-Object System.Net.WebClient
+          $txtContent = $wc.DownloadString($env:BACKUP_LIST_URL)
+
+          # \r সরাও, তারপর \n দিয়ে split
+          $lines = ($txtContent -replace "`r", "") -split "`n" |
+                   Where-Object { $_.Trim() -ne "" }
 
           Write-Host "Total lines loaded: $($lines.Count)"
 
@@ -154,7 +155,6 @@ jobs:
           $backupUrl  = ""
 
           foreach ($line in $lines) {
-            # Fix: [|] regex + max 3 parts যাতে URL এ | থাকলেও না ভাঙে
             $parts = $line.Trim() -split '[|]', 3
             if ($parts.Count -ge 3 -and $parts[0].Trim() -eq $num) {
               $backupName = $parts[1].Trim()
@@ -171,10 +171,10 @@ jobs:
             throw "Backup number $num not found in mumubackupurl.txt!"
           }
 
-          Write-Host "Found backup: $backupName"
-          Write-Host "Backup URL:   $backupUrl"
+          Write-Host "Found backup : $backupName"
+          Write-Host "Backup URL   : $backupUrl"
 
-          # ── Updated Common URLs ──
+          # ── File URLs ──
           $mumuUrl    = "http://100.72.179.64:8000/FilesForRDP/MuMu.exe"
           $zipUrl     = "http://100.72.179.64:8000/FilesForRDP/YariFinal.zip"
           $restoreUrl = "http://100.72.179.64:8000/FilesForRDP/Restore.bat"
@@ -185,43 +185,48 @@ jobs:
 
           $job1 = Start-Job -Name "MuMu" -ScriptBlock {
             param($url, $dest)
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($url, $dest)
           } -ArgumentList $mumuUrl, "$desktop\MuMu.exe"
 
           $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
             param($url, $dest)
+            $wc      = New-Object System.Net.WebClient
             $zipPath = "$dest\YariFinal.zip"
-            Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+            $wc.DownloadFile($url, $zipPath)
             Expand-Archive -Path $zipPath -DestinationPath "$dest\YariFinal" -Force
             Remove-Item $zipPath -Force
           } -ArgumentList $zipUrl, $desktop
 
           $job3 = Start-Job -Name "Backup" -ScriptBlock {
             param($url, $dest)
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($url, $dest)
           } -ArgumentList $backupUrl, "$desktop\$backupName"
 
           $job4 = Start-Job -Name "RestoreBat" -ScriptBlock {
             param($url, $dest)
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($url, $dest)
           } -ArgumentList $restoreUrl, "$desktop\Restore.bat"
 
           $job5 = Start-Job -Name "CDownBat" -ScriptBlock {
             param($url, $dest)
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($url, $dest)
           } -ArgumentList $cdownUrl, "$desktop\cDown.bat"
 
           $job6 = Start-Job -Name "StartBat" -ScriptBlock {
             param($url, $dest)
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($url, $dest)
           } -ArgumentList $startUrl, "$desktop\Start.bat"
 
           $allJobs = @($job1, $job2, $job3, $job4, $job5, $job6)
           $allJobs | Wait-Job
 
-          # প্রতিটা job এর output দেখাও
           foreach ($job in $allJobs) {
-            $out = Receive-Job $job
+            $out = Receive-Job $job 2>&1
             if ($out) { Write-Host "$($job.Name): $out" }
           }
 
