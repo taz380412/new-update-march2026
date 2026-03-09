@@ -38,7 +38,7 @@ jobs:
       - name: Install and Start Tailscale
         shell: pwsh
         run: |
-          $exe = "$env:ProgramFiles\\Tailscale\\tailscale.exe"
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $exe)) {
             Invoke-WebRequest `
@@ -76,7 +76,7 @@ jobs:
           }
 
           Set-ItemProperty `
-            "HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server" `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
             -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
@@ -105,9 +105,9 @@ jobs:
           $profilePath = $pathBuilder.ToString()
 
           if ($profilePath -and (Test-Path $profilePath)) {
-            $desktop = "$profilePath\\Desktop"
+            $desktop = "$profilePath\Desktop"
           } else {
-            $desktop = "C:\\Users\\$($env:RDP_USER)\\Desktop"
+            $desktop = "C:\Users\$($env:RDP_USER)\Desktop"
             New-Item -ItemType Directory -Path $desktop -Force | Out-Null
           }
 
@@ -137,29 +137,42 @@ jobs:
         shell: pwsh
         run: |
           $desktop = $env:USER_DESKTOP
-          $num     = "${{ inputs.backup_number }}"
+          $num     = "${{ inputs.backup_number }}".Trim()
 
           Write-Host "Fetching backup list from server..."
-          $txtContent = (Invoke-WebRequest -Uri $env:BACKUP_LIST_URL -UseBasicParsing).Content
-          $lines = $txtContent -split "`n" | Where-Object { $_.Trim() -ne "" }
 
-          $found = $false
+          # Fix: RawContentBytes দিয়ে UTF8 string, \r সরাও
+          $response   = Invoke-WebRequest -Uri $env:BACKUP_LIST_URL -UseBasicParsing
+          $txtContent = [System.Text.Encoding]::UTF8.GetString($response.RawContentBytes)
+          $lines      = ($txtContent -replace "`r", "") -split "`n" |
+                        Where-Object { $_.Trim() -ne "" }
+
+          Write-Host "Total lines loaded: $($lines.Count)"
+
+          $found      = $false
           $backupName = ""
           $backupUrl  = ""
 
           foreach ($line in $lines) {
-            $parts = $line.Trim() -split "\\|"
+            # Fix: [|] regex + max 3 parts যাতে URL এ | থাকলেও না ভাঙে
+            $parts = $line.Trim() -split '[|]', 3
             if ($parts.Count -ge 3 -and $parts[0].Trim() -eq $num) {
               $backupName = $parts[1].Trim()
               $backupUrl  = $parts[2].Trim()
-              $found = $true
+              $found      = $true
               break
             }
           }
 
           if (-not $found) {
+            Write-Host "DEBUG: Looking for number: [$num]"
+            Write-Host "DEBUG: First 5 lines:"
+            foreach ($l in $lines[0..4]) { Write-Host "  LINE: [$l]" }
             throw "Backup number $num not found in mumubackupurl.txt!"
           }
+
+          Write-Host "Found backup: $backupName"
+          Write-Host "Backup URL:   $backupUrl"
 
           # ── Updated Common URLs ──
           $mumuUrl    = "http://100.72.179.64:8000/FilesForRDP/MuMu.exe"
@@ -173,41 +186,48 @@ jobs:
           $job1 = Start-Job -Name "MuMu" -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-          } -ArgumentList $mumuUrl, "$desktop\\MuMu.exe"
+          } -ArgumentList $mumuUrl, "$desktop\MuMu.exe"
 
           $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
             param($url, $dest)
-            $zipPath = "$dest\\YariFinal.zip"
+            $zipPath = "$dest\YariFinal.zip"
             Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
-            Expand-Archive -Path $zipPath -DestinationPath "$dest\\YariFinal" -Force
+            Expand-Archive -Path $zipPath -DestinationPath "$dest\YariFinal" -Force
             Remove-Item $zipPath -Force
           } -ArgumentList $zipUrl, $desktop
 
           $job3 = Start-Job -Name "Backup" -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-          } -ArgumentList $backupUrl, "$desktop\\$backupName"
+          } -ArgumentList $backupUrl, "$desktop\$backupName"
 
-          $job4 = Start-Job -Name "RestoreTxt" -ScriptBlock {
+          $job4 = Start-Job -Name "RestoreBat" -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-          } -ArgumentList $restoreUrl, "$desktop\\Restore.bat"
+          } -ArgumentList $restoreUrl, "$desktop\Restore.bat"
 
           $job5 = Start-Job -Name "CDownBat" -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-          } -ArgumentList $cdownUrl, "$desktop\\cDown.bat"
+          } -ArgumentList $cdownUrl, "$desktop\cDown.bat"
 
           $job6 = Start-Job -Name "StartBat" -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-          } -ArgumentList $startUrl, "$desktop\\Start.bat"
+          } -ArgumentList $startUrl, "$desktop\Start.bat"
 
           $allJobs = @($job1, $job2, $job3, $job4, $job5, $job6)
           $allJobs | Wait-Job
+
+          # প্রতিটা job এর output দেখাও
+          foreach ($job in $allJobs) {
+            $out = Receive-Job $job
+            if ($out) { Write-Host "$($job.Name): $out" }
+          }
+
           $allJobs | Remove-Job -Force
 
-          Write-Host "Downloads Finished!"
+          Write-Host "All Downloads Finished!"
 
       # ---------------- PYTHON ----------------
       - name: Install Python modules
@@ -221,14 +241,13 @@ jobs:
       - name: Update Dashboard API
         shell: pwsh
         run: |
-          $ip = $env:TS_IP
+          $ip     = $env:TS_IP
           $serial = "${{ inputs.backup_number }}"
-          $user = "$env:GITHUB_ACTOR"
-          
-          # ডাটা ফরম্যাট: IP|Serial|User
-          $info = "$($ip)|$($serial)|$($user)"
+          $user   = "$env:GITHUB_ACTOR"
+
+          $info    = "$($ip)|$($serial)|$($user)"
           $encoded = [uri]::EscapeDataString($info)
-          
+
           Write-Host "Updating Dashboard at $env:UPDATE_API"
           Invoke-WebRequest -Uri "$($env:UPDATE_API)?info=$encoded" -Method Get -UseBasicParsing
 
