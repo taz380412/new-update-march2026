@@ -140,13 +140,10 @@ jobs:
 
           Write-Host "Fetching backup list from server..."
 
-          # ✅ FIX: WebClient.DownloadString() — সবচেয়ে reliable, null হয় না
           $wc         = New-Object System.Net.WebClient
           $txtContent = $wc.DownloadString($env:BACKUP_LIST_URL)
-
-          # \r সরাও, তারপর \n দিয়ে split
-          $lines = ($txtContent -replace "`r", "") -split "`n" |
-                   Where-Object { $_.Trim() -ne "" }
+          $lines      = ($txtContent -replace "`r", "") -split "`n" |
+                        Where-Object { $_.Trim() -ne "" }
 
           Write-Host "Total lines loaded: $($lines.Count)"
 
@@ -174,6 +171,19 @@ jobs:
           Write-Host "Found backup : $backupName"
           Write-Host "Backup URL   : $backupUrl"
 
+          # Timeout olmayan WebClient class
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Net;
+          public class NoTimeoutWebClient : WebClient {
+              protected override WebRequest GetWebRequest(Uri uri) {
+                  WebRequest w = base.GetWebRequest(uri);
+                  w.Timeout = System.Threading.Timeout.Infinite;
+                  return w;
+              }
+          }
+"@
+
           # ── File URLs ──
           $mumuUrl    = "http://100.72.179.64:8000/FilesForRDP/MuMu.exe"
           $zipUrl     = "http://100.72.179.64:8000/FilesForRDP/YariFinal.zip"
@@ -181,12 +191,13 @@ jobs:
           $cdownUrl   = "http://100.72.179.64:8000/FilesForRDP/cDown.bat"
           $startUrl   = "http://100.72.179.64:8000/FilesForRDP/Start.bat"
 
-          Write-Host "Starting 6 parallel downloads..."
+          Write-Host "Starting parallel downloads..."
 
           $job1 = Start-Job -Name "MuMu" -ScriptBlock {
             param($url, $dest)
             $wc = New-Object System.Net.WebClient
             $wc.DownloadFile($url, $dest)
+            Write-Host "MuMu done: $((Get-Item $dest).Length) bytes"
           } -ArgumentList $mumuUrl, "$desktop\MuMu.exe"
 
           $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
@@ -196,41 +207,96 @@ jobs:
             $wc.DownloadFile($url, $zipPath)
             Expand-Archive -Path $zipPath -DestinationPath "$dest\YariFinal" -Force
             Remove-Item $zipPath -Force
+            Write-Host "YariFinal done and extracted"
           } -ArgumentList $zipUrl, $desktop
 
+          # Backup job — No timeout, 3 retries, 4GB+ support
           $job3 = Start-Job -Name "Backup" -ScriptBlock {
             param($url, $dest)
-            $wc = New-Object System.Net.WebClient
-            $wc.DownloadFile($url, $dest)
+
+            Add-Type -TypeDefinition @"
+            using System;
+            using System.Net;
+            public class NoTimeoutWebClient : WebClient {
+                protected override WebRequest GetWebRequest(Uri uri) {
+                    WebRequest w = base.GetWebRequest(uri);
+                    w.Timeout = System.Threading.Timeout.Infinite;
+                    return w;
+                }
+            }
+"@
+            $maxRetry = 3
+            $attempt  = 0
+
+            while ($attempt -lt $maxRetry) {
+              $attempt++
+              try {
+                Write-Host "Backup attempt $attempt starting..."
+                $wc = New-Object NoTimeoutWebClient
+                $wc.DownloadFile($url, $dest)
+
+                $size = (Get-Item $dest).Length
+                if ($size -gt 1024) {
+                  Write-Host "Backup SUCCESS — $size bytes"
+                  break
+                } else {
+                  throw "File too small: $size bytes"
+                }
+              } catch {
+                Write-Host "Attempt $attempt FAILED: $_"
+                if (Test-Path $dest) { Remove-Item $dest -Force }
+                if ($attempt -lt $maxRetry) {
+                  $wait = $attempt * 15
+                  Write-Host "Waiting ${wait}s before retry..."
+                  Start-Sleep -Seconds $wait
+                }
+              }
+            }
+
+            if (-not (Test-Path $dest) -or (Get-Item $dest).Length -lt 1024) {
+              throw "Backup FAILED after $maxRetry attempts!"
+            }
+
           } -ArgumentList $backupUrl, "$desktop\$backupName"
 
           $job4 = Start-Job -Name "RestoreBat" -ScriptBlock {
             param($url, $dest)
             $wc = New-Object System.Net.WebClient
             $wc.DownloadFile($url, $dest)
+            Write-Host "Restore.bat done"
           } -ArgumentList $restoreUrl, "$desktop\Restore.bat"
 
           $job5 = Start-Job -Name "CDownBat" -ScriptBlock {
             param($url, $dest)
             $wc = New-Object System.Net.WebClient
             $wc.DownloadFile($url, $dest)
+            Write-Host "cDown.bat done"
           } -ArgumentList $cdownUrl, "$desktop\cDown.bat"
 
           $job6 = Start-Job -Name "StartBat" -ScriptBlock {
             param($url, $dest)
             $wc = New-Object System.Net.WebClient
             $wc.DownloadFile($url, $dest)
+            Write-Host "Start.bat done"
           } -ArgumentList $startUrl, "$desktop\Start.bat"
 
           $allJobs = @($job1, $job2, $job3, $job4, $job5, $job6)
           $allJobs | Wait-Job
 
+          Write-Host "===== Job Results ====="
           foreach ($job in $allJobs) {
             $out = Receive-Job $job 2>&1
-            if ($out) { Write-Host "$($job.Name): $out" }
+            $state = $job.State
+            Write-Host "$($job.Name): $state — $out"
           }
 
+          $failed = $allJobs | Where-Object { $_.State -eq "Failed" }
           $allJobs | Remove-Job -Force
+
+          if ($failed) {
+            $names = $failed.Name -join ", "
+            throw "These jobs FAILED: $names"
+          }
 
           Write-Host "All Downloads Finished!"
 
