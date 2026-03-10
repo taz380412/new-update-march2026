@@ -27,61 +27,44 @@ jobs:
 
     steps:
 
-      # ---------------- BASIC ----------------
       - name: Show runner info
         shell: pwsh
         run: |
           whoami
           systeminfo | findstr /B /C:"OS Name"
 
-      # ---------------- TAILSCALE ----------------
       - name: Install and Start Tailscale
         shell: pwsh
         run: |
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
           if (-not (Test-Path $exe)) {
-            Invoke-WebRequest `
-              https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi `
-              -OutFile tailscale.msi
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile tailscale.msi
             Start-Process msiexec.exe -ArgumentList "/i tailscale.msi /quiet /norestart" -Wait
           }
-
           Start-Service Tailscale
           Start-Sleep 10
-
           & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet"
-
           for ($i=0; $i -lt 10; $i++) {
             $ip = & $exe ip -4 | Select-Object -First 1
             if ($ip) { break }
             Start-Sleep 3
           }
-
           if (-not $ip) { throw "Tailscale IP not found" }
-
           echo "TS_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $ip"
 
-      # ---------------- RDP + USER PROFILE ----------------
       - name: Enable RDP and Create User Profile
         shell: pwsh
         run: |
           $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-
           if (-not (Get-LocalUser $env:RDP_USER -EA SilentlyContinue)) {
             New-LocalUser $env:RDP_USER -Password $sec
             Add-LocalGroupMember Administrators $env:RDP_USER
             Add-LocalGroupMember "Remote Desktop Users" $env:RDP_USER
           }
-
-          Set-ItemProperty `
-            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name fDenyTSConnections -Value 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
           Write-Host "Creating user profile..."
-
           Add-Type -TypeDefinition @"
           using System;
           using System.Runtime.InteropServices;
@@ -95,96 +78,66 @@ jobs:
                   uint cchProfilePath);
           }
           "@
-
           $user = Get-LocalUser $env:RDP_USER
           $sid  = $user.SID.Value
           $pathBuilder = New-Object System.Text.StringBuilder 260
-
           $result = [ProfileHelper]::CreateProfile($sid, $env:RDP_USER, $pathBuilder, 260)
           $profilePath = $pathBuilder.ToString()
-
           if ($profilePath -and (Test-Path $profilePath)) {
             $desktop = "$profilePath\Desktop"
           } else {
             $desktop = "C:\Users\$($env:RDP_USER)\Desktop"
             New-Item -ItemType Directory -Path $desktop -Force | Out-Null
           }
-
           if (-not (Test-Path $desktop)) {
             New-Item -ItemType Directory -Path $desktop -Force | Out-Null
           }
-
           icacls $desktop /grant "${env:RDP_USER}:(OI)(CI)F" /T /Q
-
           Write-Host "Desktop path: $desktop"
           echo "USER_DESKTOP=$desktop" >> $env:GITHUB_ENV
 
-      # ---------------- IP & SERIAL LOG ----------------
       - name: Show IP and Serial
         shell: pwsh
         run: |
-          Write-Host ""
           Write-Host "=========================================="
           Write-Host "  $env:TS_IP  |  ${{ inputs.backup_number }}"
           Write-Host "=========================================="
-          Write-Host ""
 
-      # ============================================================
-      #       FETCH TXT + PARALLEL DOWNLOAD (6 FILES)
-      # ============================================================
       - name: "Download All Files (Backup #${{ inputs.backup_number }})"
         shell: pwsh
         run: |
           $desktop = $env:USER_DESKTOP
-          $num     = "${{ inputs.backup_number }}".Trim()
+          $num = "${{ inputs.backup_number }}".Trim()
 
-          Write-Host "Fetching backup list from server..."
-
-          $wc         = New-Object System.Net.WebClient
+          Write-Host "Fetching backup list..."
+          $wc = New-Object System.Net.WebClient
           $txtContent = $wc.DownloadString($env:BACKUP_LIST_URL)
-          $lines      = ($txtContent -replace "`r", "") -split "`n" |
-                        Where-Object { $_.Trim() -ne "" }
+          $lines = ($txtContent -replace "`r", "") -split "`n" | Where-Object { $_.Trim() -ne "" }
+          Write-Host "Total lines: $($lines.Count)"
 
-          Write-Host "Total lines loaded: $($lines.Count)"
-
-          $found      = $false
+          $found = $false
           $backupName = ""
-          $backupUrl  = ""
+          $backupUrl = ""
 
           foreach ($line in $lines) {
             $parts = $line.Trim() -split '[|]', 3
             if ($parts.Count -ge 3 -and $parts[0].Trim() -eq $num) {
               $backupName = $parts[1].Trim()
-              $backupUrl  = $parts[2].Trim()
-              $found      = $true
+              $backupUrl = $parts[2].Trim()
+              $found = $true
               break
             }
           }
 
           if (-not $found) {
-            Write-Host "DEBUG: Looking for number: [$num]"
-            Write-Host "DEBUG: First 5 lines:"
-            foreach ($l in $lines[0..4]) { Write-Host "  LINE: [$l]" }
-            throw "Backup number $num not found in mumubackupurl.txt!"
+            Write-Host "DEBUG: Looking for: [$num]"
+            foreach ($l in $lines[0..4]) { Write-Host "LINE: [$l]" }
+            throw "Backup number $num not found!"
           }
 
-          Write-Host "Found backup : $backupName"
-          Write-Host "Backup URL   : $backupUrl"
+          Write-Host "Backup: $backupName"
+          Write-Host "URL: $backupUrl"
 
-          # Timeout olmayan WebClient class
-          Add-Type -TypeDefinition @"
-          using System;
-          using System.Net;
-          public class NoTimeoutWebClient : WebClient {
-              protected override WebRequest GetWebRequest(Uri uri) {
-                  WebRequest w = base.GetWebRequest(uri);
-                  w.Timeout = System.Threading.Timeout.Infinite;
-                  return w;
-              }
-          }
-"@
-
-          # ── File URLs ──
           $mumuUrl    = "http://100.72.179.64:8000/FilesForRDP/MuMu.exe"
           $zipUrl     = "http://100.72.179.64:8000/FilesForRDP/YariFinal.zip"
           $restoreUrl = "http://100.72.179.64:8000/FilesForRDP/Restore.bat"
@@ -202,42 +155,27 @@ jobs:
 
           $job2 = Start-Job -Name "YariFinal" -ScriptBlock {
             param($url, $dest)
-            $wc      = New-Object System.Net.WebClient
+            $wc = New-Object System.Net.WebClient
             $zipPath = "$dest\YariFinal.zip"
             $wc.DownloadFile($url, $zipPath)
             Expand-Archive -Path $zipPath -DestinationPath "$dest\YariFinal" -Force
             Remove-Item $zipPath -Force
-            Write-Host "YariFinal done and extracted"
+            Write-Host "YariFinal done"
           } -ArgumentList $zipUrl, $desktop
 
-          # Backup job — No timeout, 3 retries, 4GB+ support
           $job3 = Start-Job -Name "Backup" -ScriptBlock {
             param($url, $dest)
-
-            Add-Type -TypeDefinition @"
-            using System;
-            using System.Net;
-            public class NoTimeoutWebClient : WebClient {
-                protected override WebRequest GetWebRequest(Uri uri) {
-                    WebRequest w = base.GetWebRequest(uri);
-                    w.Timeout = System.Threading.Timeout.Infinite;
-                    return w;
-                }
-            }
-"@
             $maxRetry = 3
-            $attempt  = 0
-
+            $attempt = 0
             while ($attempt -lt $maxRetry) {
               $attempt++
               try {
-                Write-Host "Backup attempt $attempt starting..."
-                $wc = New-Object NoTimeoutWebClient
-                $wc.DownloadFile($url, $dest)
-
+                Write-Host "Backup attempt $attempt..."
+                if (Test-Path $dest) { Remove-Item $dest -Force }
+                Start-BitsTransfer -Source $url -Destination $dest -TransferType Download -ErrorAction Stop
                 $size = (Get-Item $dest).Length
                 if ($size -gt 1024) {
-                  Write-Host "Backup SUCCESS — $size bytes"
+                  Write-Host "Backup SUCCESS: $size bytes"
                   break
                 } else {
                   throw "File too small: $size bytes"
@@ -245,18 +183,12 @@ jobs:
               } catch {
                 Write-Host "Attempt $attempt FAILED: $_"
                 if (Test-Path $dest) { Remove-Item $dest -Force }
-                if ($attempt -lt $maxRetry) {
-                  $wait = $attempt * 15
-                  Write-Host "Waiting ${wait}s before retry..."
-                  Start-Sleep -Seconds $wait
-                }
+                if ($attempt -lt $maxRetry) { Start-Sleep -Seconds ($attempt * 15) }
               }
             }
-
             if (-not (Test-Path $dest) -or (Get-Item $dest).Length -lt 1024) {
               throw "Backup FAILED after $maxRetry attempts!"
             }
-
           } -ArgumentList $backupUrl, "$desktop\$backupName"
 
           $job4 = Start-Job -Name "RestoreBat" -ScriptBlock {
@@ -286,21 +218,18 @@ jobs:
           Write-Host "===== Job Results ====="
           foreach ($job in $allJobs) {
             $out = Receive-Job $job 2>&1
-            $state = $job.State
-            Write-Host "$($job.Name): $state — $out"
+            Write-Host "$($job.Name): $($job.State) -- $out"
           }
 
           $failed = $allJobs | Where-Object { $_.State -eq "Failed" }
           $allJobs | Remove-Job -Force
 
           if ($failed) {
-            $names = $failed.Name -join ", "
-            throw "These jobs FAILED: $names"
+            throw "FAILED jobs: $($failed.Name -join ', ')"
           }
 
           Write-Host "All Downloads Finished!"
 
-      # ---------------- PYTHON ----------------
       - name: Install Python modules
         shell: pwsh
         run: |
@@ -308,21 +237,17 @@ jobs:
           pip install customtkinter uiautomator2 opencv-python playwright
           playwright install
 
-      # ---------------- UPDATE DASHBOARD API ----------------
       - name: Update Dashboard API
         shell: pwsh
         run: |
           $ip     = $env:TS_IP
           $serial = "${{ inputs.backup_number }}"
           $user   = "$env:GITHUB_ACTOR"
-
           $info    = "$($ip)|$($serial)|$($user)"
           $encoded = [uri]::EscapeDataString($info)
-
-          Write-Host "Updating Dashboard at $env:UPDATE_API"
+          Write-Host "Updating Dashboard..."
           Invoke-WebRequest -Uri "$($env:UPDATE_API)?info=$encoded" -Method Get -UseBasicParsing
 
-      # ---------------- KEEP ALIVE ----------------
       - name: Keep alive
         shell: pwsh
         run: |
